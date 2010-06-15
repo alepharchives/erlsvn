@@ -15,4 +15,14 @@ erlsvn - is a svn dump parser + some associate functionality.
     svnsync sync file:///home/tobbe/junk/my-svn-repo
     svnadmin dump my-svn-repo > my-svn-repo.dump
 
+# Run the converter
+
+    #
+    # Remove the put to disable step by step execution
+    # Arg1: Name of the svn dump-file
+    # Arg2: Name of a (non-existing) directory to hold the git repo.
+    #
+    1 > put(dbg,true),svn2git:run("my-svn-repo.dump","my-svn-repo-git").
+
+
 
