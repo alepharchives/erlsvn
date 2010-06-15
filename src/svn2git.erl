@@ -31,6 +31,7 @@
 
 -define(print(Fmt,Var), io:format(Fmt++" ~s=~p~n",[??Var,Var])).
 
+
 dbg(R) ->
     case get(dbg) of
         true ->
@@ -180,11 +181,17 @@ c(S, #change{path=Path, kind=dir, action=add}) ->
 c(S, #change{path=Path, kind=file, action=Action, data=Data}) 
   when ((Action == add) orelse (Action == change)) ->
     Fname = b2l(get_path(preds(S), Path)),
-    ok = file:write_file(Fname, Data),
+    %?print("c: ", Fname),
+    %?print("c: ", Data),
+    ok = file:write_file(Fname, data(Data)),
     add_git(Fname),
     {break, changed(S, true)};
 c(S, _) ->
     {cont, S}.
+
+data(none) -> "";
+data(Data) -> Data.
+    
 
 ignore(S, Bool)  when ?is_bool(Bool) -> S#s{ignore=Bool}.
 changed(S, Bool) when ?is_bool(Bool) -> S#s{changed=Bool}.
@@ -221,16 +228,17 @@ co_git(#s{current=Branch, branches=Bs} = S) ->
             
 %% NB: Using '--date' seem to require vsn: 1.7.0.5
 ci_git(#s{author=Author, date=Date, log=Log}) ->
+    ok = file:write_file("/tmp/cmsg", no_empty_msg(Log)),
     Cmd = "git commit -a --allow-empty "
         "--author='"++author_git(Author)++"' "++
         "--date='"++date_git(Date)++"' "++
-        "-m '"++no_empty_msg(b2l(Log))++"'",
-    Res = os:cmd(Cmd),
+        "--file /tmp/cmsg",
     ?print("=== Commit: ", Cmd),
+    Res = os:cmd(Cmd),
     ?print("--- Commit: ", Res).
 
-no_empty_msg("")  -> "_empty_";
-no_empty_msg(Msg) -> Msg.
+no_empty_msg(<<>>)                    -> <<"_empty_">>;
+no_empty_msg(Msg) when is_binary(Msg) -> Msg.
     
 
 %% FIXME should map author against the users.txt file !!
