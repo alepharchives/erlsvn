@@ -4,11 +4,15 @@
 %% @author Torbjorn Tornkvist <tobbe@klarna.com>
 %% @copyright 2010 Torbjorn Tornkvist
 %% @doc Replay svn dumpfile in order to create a git repos.
-
+%% ---------------------------------------------------------------------
 -module(svn2git).
 
-%%-export([run/2]).
--compile(export_all).
+%%-compile(export_all).
+-export([run/2
+         , run/3
+         , run/4
+         , parse_users_txt/1
+        ]).
 
 
 -include_lib("eunit/include/eunit.hrl").
@@ -20,12 +24,14 @@
             , log
             , date
             , author
+            , users=[]
             , changed=false
             , ignore=false
             , current=trunk
             , merge_p=false
             , merge_from
             , merge_to
+            , bp
             , branches=[]
             , preds=default_preds()
          }).
@@ -35,7 +41,77 @@
 -define(print(Fmt,Var), io:format(Fmt++" ~s=~p~n",[??Var,Var])).
 
 
-dbg(R) ->
+%% -------------------------------------------------------
+%% @doc Replay the commits in the Svn dump as Git commits.
+run(SvnDumpFile, GitDir) ->
+    run(SvnDumpFile, GitDir, "").
+
+%% -------------------------------------------------------
+%% @doc As run/2 + a users.txt file path.
+run(SvnDumpFile, GitDir, UserTxtFile) ->
+    run(SvnDumpFile, GitDir, UserTxtFile, []).
+
+%% -------------------------------------------------------
+%% @doc As run/3 + a list of options
+%%
+%%   {bp, Revision::int() }  --  Enter 'debugger' at Revision
+%%
+run(SvnDumpFile, GitDir, UserTxtFile, Opts) 
+  when is_list(SvnDumpFile) andalso 
+       is_list(UserTxtFile) andalso
+       is_list(GitDir) andalso
+       is_list(Opts) ->
+    case filelib:is_dir(GitDir) of
+        false ->
+            {ok, Bin} = file:read_file(SvnDumpFile),
+            Users = maybe_parse_users_txt(UserTxtFile),
+            mkdir(GitDir),
+            ok = file:set_cwd(GitDir),
+            init_git(),
+            feed(opts(#s{dir=GitDir,users=Users}, Opts),
+                 % The actions 
+                 [fun ci/2,     % commit outstanding changes
+                  fun br/2,     % setup proper branch
+                  fun rv/2,     % check for a new svn revision
+                  fun ch/2      % perform any repository changes
+                 ],
+                 Bin);
+        _ ->
+            {error, "Git directory already exist!"}
+    end.
+
+
+maybe_parse_users_txt(Fname) ->
+    try parse_users_txt(Fname)
+    catch 
+        _:_ -> 
+            io:format("WARNING: No valid users.txt file!~n",[]),
+            [] 
+    end.
+            
+parse_users_txt(Fname) ->
+    {ok,Bin} = file:read_file(Fname),
+    F = fun(Line) ->
+                {match, [Uid,Name,Email]} = 
+                    re:run(Line,
+                           "([^ ]*)[ =]*"
+                           "([^<]*)"
+                           "(.*)",
+                           [{capture,[1,2,3],list}]),
+                {Uid,string:strip(Name),Email}
+        end,
+    [F(Line) || Line <- string:tokens(b2l(Bin),"\n")].
+
+
+
+
+%% Parse and save options
+opts(S, [{bp,N}|Opts]) when is_integer(N) -> opts(S#s{bp=N}, Opts);
+opts(S, [_|Opts])                         -> opts(S, Opts);
+opts(S, [])                               -> S.
+    
+
+debugger(R) ->
     case get(dbg) of
         true ->
             io:format("+ ~p.\n", [no_data(R)]),
@@ -43,6 +119,10 @@ dbg(R) ->
         _ ->
             ok
     end.
+
+%% Set breakpoint
+bp(true) -> put(dbg,true);
+bp(_)    -> false.
 
 %no_data(X)           -> X;
 no_data(#change{}=C) -> C#change{data="..."};
@@ -65,13 +145,13 @@ default_preds() ->
      end,
      fun(Path) -> 
              {match, [B,X]} = re:run(Path, 
-                                     <<"^.*branches/([^/]*)/(.*)">>,
+                                     <<"^.*branches/([^/:]*)/(.*)">>,
                                      [{capture,[1,2],binary}]),
              {branch, B, X}
      end,
-     fun(Path) -> 
+     fun(Path) ->
              {match, [B]} = re:run(Path, 
-                                   <<"^.*branches/([^/ :]*).*">>,
+                                   <<"^.*branches/([^ :]*).*">>,
                                    [{capture,[1],binary}]),
              {branch, B, <<>>}
      end,
@@ -87,34 +167,16 @@ default_preds() ->
     ].
              
 
-%% @doc Replay the commits in the Svn dump as Git commits.
-run(SvnDumpFile, GitDir) when is_list(SvnDumpFile) andalso is_list(GitDir) ->
-    case filelib:is_dir(GitDir) of
-        false ->
-            {ok, Bin} = file:read_file(SvnDumpFile),
-            mkdir(GitDir),
-            ok = file:set_cwd(GitDir),
-            init_git(),
-            feed(#s{dir=GitDir},
-                 % The actions 
-                 [fun ci/2,     % commit outstanding changes
-                  fun br/2,     % setup proper branch
-                  fun rv/2,     % check for a new svn revision
-                  fun ch/2      % perform any repository changes
-                 ],
-                 Bin);
-        _ ->
-            {error, "Git directory already exist!"}
-    end.
-
 %% @doc Consume the svn dump.
 feed(_, _, <<>>) -> ok;
 feed(S, Fs, Bin) ->
     case svndump:scan_record(Bin) of
-	{{[], [], <<>>}, <<>>} ->
-	    ok;  % ignore trailing empty lines
+	none ->
+            % Commit any final outstanding data.
+            S#s.changed == true andalso ci_git(S),
+	    ok; 
         {R, Rest} ->
-            dbg(R),
+            debugger(R),
             feed(until(S, Fs, R), Fs, Rest)
     end.
 
@@ -182,8 +244,8 @@ get_path([], Path) ->
 %% ---------------------------------------------------------------------
 %% @doc The start of a svn revision, extract the revision info.
 %%
-rv(S, #revision{number=N, properties=Ps, changes=_Cs}) -> 
-    bp(N == 163),
+rv(#s{bp=BP} = S, #revision{number=N, properties=Ps, changes=_Cs}) -> 
+    bp(N == BP),
     {break, props(ignore(S#s{rev=N},false), Ps)};
 rv(S, _) -> 
     {cont, S}.
@@ -197,8 +259,8 @@ props(S, [])                                -> S.
 merge_p(#s{log=Log, current=Current} = S) ->
     ?print("merge_p: ", Log),
     ?print("merge_p: ", Current),
-    case string:rstr(b2l(Log), "merge") of
-        0 -> S;
+    case re:run(Log, <<".*([mM][eE][rR][gG][eE]).*">>) of
+        nomatch -> S;
         _ ->
             % Try to guess From/To of a possible merge.
             try get_branch(preds(S), Log) of
@@ -217,7 +279,7 @@ merge_p(#s{log=Log, current=Current} = S) ->
                         merge_from = Current, 
                         merge_to   = Branch}
 
-            catch throw:{ignore,_What} -> S end
+            catch throw:{ignore,_What} -> S#s{merge_p = true} end
 
     end.
                                
@@ -226,7 +288,7 @@ merge_p(#s{log=Log, current=Current} = S) ->
 %% ---------------------------------------------------------------------
 %% @doc Perform the repository changes.
 %%
-ch(#s{merge_p=true} = S, #change{path=Path, kind=dir, action=change} = X) ->
+ch(#s{merge_p=true} = S, #change{kind=dir, action=change} = X) ->
     {break, ignore(maybe_merge(S, X), true)};
 ch(#s{ignore=false} = S, #change{path=Path, kind=dir, action=Action})
   when ((Action == add) orelse (Action == change)) ->
@@ -247,6 +309,8 @@ maybe_merge(#s{} = S, #change{path=Path} = X) ->
     {From, To} = check_for_merge_info(S, X),
     try trunk2master(get_branch(preds(S), Path)) of
         To ->
+            ?print("maybe_merge: ", From),
+            ?print("maybe_merge: ", To),
             merge_git(S, From, To),
             S#s{merge_p = false};
         ToBranch ->
@@ -327,10 +391,10 @@ co_git(#s{current=Branch, branches=Bs} = S) ->
     end.
             
 %% NB: Using '--date' seem to require vsn: 1.7.0.5
-ci_git(#s{author=Author, date=Date, log=Log}) ->
+ci_git(#s{author=Author, date=Date, log=Log, users=Users}) ->
     ok = file:write_file("/tmp/cmsg", no_empty_msg(Log)),
     Cmd = "git commit -a --allow-empty "
-        "--author='"++author_git(Author)++"' "++
+        "--author='"++author_git(Author,Users)++"' "++
         "--date='"++date_git(Date)++"' "++
         "--file /tmp/cmsg",
     ?print("=== Commit: ", Cmd),
@@ -346,19 +410,23 @@ merge_git(S, From, To) ->
     ?print("merge_git: ", Res),
     ci_git(S).
 
-    
-%% FIXME should map author against the users.txt file !!
-author_git(Author) ->
-    "Torbjorn Tornkvist <tobbe@klarna.com>".
+
+%% @doc Get Name and Email from user list or fallback to USER@HOST.
+author_git(Author, Users) ->
+    try 
+        {value, {_,Name,Email}} = lists:keysearch(b2l(Author), 1, Users),
+        Name++" "++Email
+    catch
+        _:_ ->
+            {ok,Host} = inet:gethostname(),
+            User = os:getenv("USER"),
+            User++" <"++User++"@"++Host++">"
+    end.
 
 date_git(SvnDate) ->
     [Date|_] = string:tokens(b2l(SvnDate), "."),
     Date.
 
-%% Set breakpoint
-bp(true) -> put(dbg,true);
-bp(_)    -> false.
-    
 
 -ifdef(EUNIT).
 
@@ -372,12 +440,11 @@ default_preds_branch_test() ->
     F = hd(tl(tl(default_preds()))), % FIXME use separate pred functions
     ?assertMatch({branch,<<"home">>,<<"flundra/.gnus">>}, F(Path)).
 
-
-%% FIXME setup the use of a proper users.txt file.
 author_git_test() ->
     SvnAuthor = <<"tobbe">>,
     GitAuthor = "Torbjorn Tornkvist <tobbe@klarna.com>",
-    ?assertMatch(GitAuthor, author_git(SvnAuthor)).
+    Users = [{"tobbe","Torbjorn Tornkvist","<tobbe@klarna.com>"}],
+    ?assertMatch(GitAuthor, author_git(SvnAuthor,Users)).
 
 date_git_test() ->
     SvnDate = <<"2008-10-06T13:30:06.551146Z">>,
