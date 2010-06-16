@@ -7,8 +7,16 @@
 
 -module(svndump).
 
--export([dump_to_terms/1, scan_records/1, header_vsn/1, header_default/1,
-	 header_type/1, header_name/1, format_records/1, filter_dump/2]).
+-export([dump_to_terms/1
+         , scan_records/1
+         , scan_record/1
+         , header_vsn/1
+         , header_default/1
+	 , header_type/1
+         , header_name/1
+         , format_records/1
+         , filter_dump/2
+        ]).
 
 -include_lib("eunit/include/eunit.hrl").
 
