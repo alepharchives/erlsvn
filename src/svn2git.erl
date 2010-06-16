@@ -7,8 +7,8 @@
 
 -module(svn2git).
 
--export([run/2]).
-%%-compile(export_all).
+%%-export([run/2]).
+-compile(export_all).
 
 
 -include_lib("eunit/include/eunit.hrl").
@@ -23,6 +23,9 @@
             , changed=false
             , ignore=false
             , current=trunk
+            , merge_p=false
+            , merge_from
+            , merge_to
             , branches=[]
             , preds=default_preds()
          }).
@@ -55,10 +58,28 @@ default_preds() ->
              {trunk, X}
      end,
      fun(Path) -> 
+             {match, [X]} = re:run(Path, 
+                                   <<"^.*trunk">>,
+                                   [{capture,[1],binary}]),
+             {trunk, X}
+     end,
+     fun(Path) -> 
              {match, [B,X]} = re:run(Path, 
                                      <<"^.*branches/([^/]*)/(.*)">>,
                                      [{capture,[1,2],binary}]),
              {branch, B, X}
+     end,
+     fun(Path) -> 
+             {match, [B]} = re:run(Path, 
+                                   <<"^.*branches/([^/ :]*).*">>,
+                                   [{capture,[1],binary}]),
+             {branch, B, <<>>}
+     end,
+     fun(Path) -> 
+             {match, [B]} = re:run(Path, 
+                                   <<"^.*branches/([^/ ]*).*">>,
+                                   [{capture,[1],binary}]),
+             {branch, B, <<>>}
      end,
      fun(Path) -> 
              throw({ignore,Path})
@@ -75,10 +96,11 @@ run(SvnDumpFile, GitDir) when is_list(SvnDumpFile) andalso is_list(GitDir) ->
             ok = file:set_cwd(GitDir),
             init_git(),
             feed(#s{dir=GitDir},
-                 [fun i/2,
-                  fun g/2,
-                  fun r/2,
-                  fun c/2
+                 % The actions 
+                 [fun ci/2,     % commit outstanding changes
+                  fun br/2,     % setup proper branch
+                  fun rv/2,     % check for a new svn revision
+                  fun ch/2      % perform any repository changes
                  ],
                  Bin);
         _ ->
@@ -93,7 +115,7 @@ feed(S, Fs, Bin) ->
 	    ok;  % ignore trailing empty lines
         {R, Rest} ->
             dbg(R),
-            feed(until(ignore(S, false), Fs, R), Fs, Rest)
+            feed(until(S, Fs, R), Fs, Rest)
     end.
 
 %% @doc Apply the actions for each entry until success.
@@ -103,7 +125,7 @@ until(S, [F|Fs], R) ->
         {break, S1} -> S1;
         {cont, S1}  -> until(S1, Fs, R)
     catch 
-        throw:{ignore,_What} -> ignore(S,true)
+        throw:{ignore,_What} -> S
     end.
 
     
@@ -113,21 +135,21 @@ until(S, [F|Fs], R) ->
 %% Before a new revision is handled, we need to commit the outstanding
 %% changes that we have made to the git repository. 
 %%
-i(#s{changed=true} = S, #revision{}) ->
+ci(#s{changed=true} = S, #revision{}) ->
     ci_git(S),
     {cont, changed(S,false)};
-i(S, _) ->
+ci(S, _) ->
     {cont, S}.
 
 %% ---------------------------------------------------------------------
 %% @doc Setup the proper branch.
 %%
-g(#s{current = Current} = S, #change{path=Path}) ->
+br(#s{current = Current} = S, #change{path=Path}) ->
     case get_branch(preds(S), Path) of
         Current -> {cont, S}; 
         Branch  -> {cont, co_git(S#s{current=Branch})}
     end;
-g(S, _) ->
+br(S, _) ->
     {cont, S}.
 
 preds(#s{preds=Ps}) -> Ps.
@@ -160,25 +182,57 @@ get_path([], Path) ->
 %% ---------------------------------------------------------------------
 %% @doc The start of a svn revision, extract the revision info.
 %%
-r(S, #revision{number=N, properties=Ps, changes=_Cs}) -> 
-    {break, props(S#s{rev=N}, Ps)};
-r(S, _) -> 
+rv(S, #revision{number=N, properties=Ps, changes=_Cs}) -> 
+    bp(N == 163),
+    {break, props(ignore(S#s{rev=N},false), Ps)};
+rv(S, _) -> 
     {cont, S}.
 
 props(S, [{<<"svn:author">>, Author} | Ps]) -> props(S#s{author = Author}, Ps);
 props(S, [{<<"svn:date">>,   Date} | Ps])   -> props(S#s{date = Date}, Ps);
-props(S, [{<<"svn:log">>,    Log} | Ps])    -> props(S#s{log = Log}, Ps);
+props(S, [{<<"svn:log">>,    Log} | Ps])    -> props(merge_p(S#s{log = Log}), Ps);
 props(S, [_|Ps])                            -> props(S, Ps);
 props(S, [])                                -> S.
+
+merge_p(#s{log=Log, current=Current} = S) ->
+    ?print("merge_p: ", Log),
+    ?print("merge_p: ", Current),
+    case string:rstr(b2l(Log), "merge") of
+        0 -> S;
+        _ ->
+            % Try to guess From/To of a possible merge.
+            try get_branch(preds(S), Log) of
+
+                Current ->
+                    S#s{merge_p    = true, 
+                        merge_from = Current};
+
+                trunk ->
+                    S#s{merge_p    = true, 
+                        merge_from = Current, 
+                        merge_to   = <<"master">>};
+
+                Branch ->
+                    S#s{merge_p    = true, 
+                        merge_from = Current, 
+                        merge_to   = Branch}
+
+            catch throw:{ignore,_What} -> S end
+
+    end.
+                               
 
 
 %% ---------------------------------------------------------------------
 %% @doc Perform the repository changes.
 %%
-c(S, #change{path=Path, kind=dir, action=add}) ->
+ch(#s{merge_p=true} = S, #change{path=Path, kind=dir, action=change} = X) ->
+    {break, ignore(maybe_merge(S, X), true)};
+ch(#s{ignore=false} = S, #change{path=Path, kind=dir, action=Action})
+  when ((Action == add) orelse (Action == change)) ->
     mkdir(b2l(get_path(preds(S), Path))),
     {break, changed(S, true)};
-c(S, #change{path=Path, kind=file, action=Action, data=Data}) 
+ch(#s{ignore=false} = S, #change{path=Path, kind=file, action=Action, data=Data}) 
   when ((Action == add) orelse (Action == change)) ->
     Fname = b2l(get_path(preds(S), Path)),
     %?print("c: ", Fname),
@@ -186,8 +240,54 @@ c(S, #change{path=Path, kind=file, action=Action, data=Data})
     ok = file:write_file(Fname, data(Data)),
     add_git(Fname),
     {break, changed(S, true)};
-c(S, _) ->
+ch(S, _) ->
     {cont, S}.
+
+maybe_merge(#s{} = S, #change{path=Path} = X) ->
+    {From, To} = check_for_merge_info(S, X),
+    try trunk2master(get_branch(preds(S), Path)) of
+        To ->
+            merge_git(S, From, To),
+            S#s{merge_p = false};
+        ToBranch ->
+            ?print("maybe_merge: ", ToBranch),
+            ?print("maybe_merge: ", To),
+            S#s{merge_p = false}
+    catch 
+        throw:{ignore,_What} ->
+            ?print("maybe_merge: ", Path),
+            merge_git(S, From, To),
+            S#s{merge_p = false}
+    end.
+
+check_for_merge_info(#s{merge_from=From0, merge_to=To0} = S, #change{path=Path} = X) ->
+    Ps = properties(X),
+    case lists:keysearch(<<"svn:mergeinfo">>,1,Ps) of
+        {value, {_,ToPath}} ->
+            % Ex.Path: <<"/branches/acceptor-11334:162-163">>
+            Preds = preds(S),
+            try 
+                FromBranch = get_branch(Preds, ToPath),
+                ToBranch   = get_branch(Preds, Path),
+                ?print("check_for_merge_info: ", FromBranch),
+                ?print("check_for_merge_info: ", ToBranch),
+                {trunk2master(FromBranch),
+                 trunk2master(ToBranch)}
+            catch
+                throw:{ignore,_What} ->
+                    {From0, To0}
+            end;
+        _ ->
+            {From0, To0}
+    end.
+
+
+properties(#change{properties=Ps})   -> Ps;
+properties(#revision{properties=Ps}) -> Ps.
+    
+trunk2master(trunk)  -> "master";
+trunk2master(Branch) -> Branch.
+    
 
 data(none) -> "";
 data(Data) -> Data.
@@ -239,8 +339,14 @@ ci_git(#s{author=Author, date=Date, log=Log}) ->
 
 no_empty_msg(<<>>)                    -> <<"_empty_">>;
 no_empty_msg(Msg) when is_binary(Msg) -> Msg.
-    
 
+merge_git(S, From, To) ->            
+    Res = os:cmd("(git checkout "++b2l(To)++
+                 "; git merge --no-ff "++b2l(From)++")"),
+    ?print("merge_git: ", Res),
+    ci_git(S).
+
+    
 %% FIXME should map author against the users.txt file !!
 author_git(Author) ->
     "Torbjorn Tornkvist <tobbe@klarna.com>".
@@ -249,6 +355,10 @@ date_git(SvnDate) ->
     [Date|_] = string:tokens(b2l(SvnDate), "."),
     Date.
 
+%% Set breakpoint
+bp(true) -> put(dbg,true);
+bp(_)    -> false.
+    
 
 -ifdef(EUNIT).
 
@@ -259,7 +369,7 @@ default_preds_trunk_test() ->
 
 default_preds_branch_test() ->
     Path = <<"tobbe/branches/home/flundra/.gnus">>,
-    F = hd(tl(default_preds())), % FIXME use separate pred functions
+    F = hd(tl(tl(default_preds()))), % FIXME use separate pred functions
     ?assertMatch({branch,<<"home">>,<<"flundra/.gnus">>}, F(Path)).
 
 
