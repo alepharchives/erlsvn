@@ -18,11 +18,12 @@ erlsvn - is a svn dump parser + some associate functionality.
 # Run the converter
 
     #
-    # Remove the put to disable step by step execution
     # Arg1: Name of the svn dump-file
     # Arg2: Name of a (non-existing) directory to hold the git repo.
+    # Arg3: Name of the users.txt file (recommended but optional).
+    # Set a break-point at revision 5 (optional).
     #
-    1 > put(dbg,true),svn2git:run("my-svn-repo.dump","my-svn-repo-git").
+    1 > svn2git:run("my-svn-repo.dump","my-svn-repo-git", "users.txt",[{bp,5}]).
 
 
 
